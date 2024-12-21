@@ -11,13 +11,17 @@ class AudioVisualizer(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Audio Visualizer")
-        self.setGeometry(100, 100, 1200, 800)
+        self.setGeometry(100, 100, 1200, 500)
         
-        self.CHUNK = 1024
+        self.CHUNK = 2048  
         self.FORMAT = pyaudio.paFloat32
         self.CHANNELS = 1
         self.RATE = 44100
         self.p = pyaudio.PyAudio()
+        
+        self.smoothing_factor = 0.3
+        self.previous_fft = np.zeros(256)
+        self.smoothed_fft = np.zeros(256)
         
         self.input_devices = self.get_input_devices()
         self.current_device_index = None
@@ -26,7 +30,7 @@ class AudioVisualizer(QMainWindow):
         self.pattern = "0"
         self.style = "line"
         self.color = QColor(0, 255, 255)
-        self.background_color = QColor(0, 255, 0)
+        self.background_color = QColor(0, 0, 255)
         self.transparent_background = True
         self.frequency_range = [0, 255]
         self.is_running = False
@@ -162,12 +166,27 @@ class AudioVisualizer(QMainWindow):
         right_layout.addWidget(self.noise_gate_slider)
         right_layout.addWidget(self.noise_gate_value_label)
         
+        smoothing_label = QLabel("Smoothing Factor")
+        self.smoothing_slider = QSlider(Qt.Orientation.Horizontal)
+        self.smoothing_slider.setRange(0, 100)
+        self.smoothing_slider.setValue(int(self.smoothing_factor * 100))
+        self.smoothing_slider.valueChanged.connect(self.update_smoothing)
+        self.smoothing_value_label = QLabel(f"Smoothing: {self.smoothing_factor:.2f}")
+        
+        right_layout.addWidget(smoothing_label)
+        right_layout.addWidget(self.smoothing_slider)
+        right_layout.addWidget(self.smoothing_value_label)
+        
         right_widget.setLayout(right_layout)
         
         layout.addWidget(left_widget)
         layout.addWidget(right_widget)
         
         central_widget.setLayout(layout)
+        
+    def update_smoothing(self):
+        self.smoothing_factor = self.smoothing_slider.value() / 100
+        self.smoothing_value_label.setText(f"Smoothing: {self.smoothing_factor:.2f}")
 
     def update_input_device(self, index):
         if self.is_running:
@@ -195,7 +214,7 @@ class AudioVisualizer(QMainWindow):
             )
             self.is_running = True
             self.toggle_button.setText("Stop Visualizer")
-            self.timer.start(16)
+            self.timer.start(33)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not start audio stream: {str(e)}")
             self.is_running = False
@@ -256,19 +275,100 @@ class VisualizerCanvas(QWidget):
         super().__init__(parent)
         self.parent = parent
         self.setMinimumSize(600, 400)
-    
-    def paintEvent(self, event):
-        if not self.parent.is_running:
-            return
         
+        self.previous_frames = []
+        self.max_frames = 3
+        
+        self.decay_factor = 0.85  # 衰減係數，可以調整這個值來改變衰減速度
+        self.current_values = np.zeros(256)  # 存儲當前的值
+        
+    def process_audio_data(self, audio_data):
+        window = np.hanning(len(audio_data))
+        windowed_data = audio_data * window
+        
+        fft_data = np.abs(np.fft.fft(windowed_data)[:256])
+        
+        self.parent.smoothed_fft = (self.parent.smoothing_factor * fft_data + 
+                                (1 - self.parent.smoothing_factor) * self.parent.previous_fft)
+        self.parent.previous_fft = self.parent.smoothed_fft.copy()
+        
+        processed_data = np.zeros(256)
+        start_freq, end_freq = self.parent.frequency_range
+        frequency_step = (end_freq - start_freq) / len(processed_data)
+        
+        if self.parent.pattern == "0":
+            for i in range(len(processed_data)):
+                data_index = int(start_freq + i * frequency_step)
+                if 0 <= data_index < len(self.parent.smoothed_fft):
+                    processed_data[i] = self.parent.smoothed_fft[data_index]
+        else:
+            # Pattern 1: 從中間對稱
+            start_index = int(start_freq)
+            end_index = int(end_freq)
+            selected_data = self.parent.smoothed_fft[start_index:end_index+1]
+            
+            display_length = len(processed_data)
+            half_length = display_length // 2
+            
+            if len(selected_data) > 0:
+                # 重新採樣到一半長度
+                indices = np.linspace(0, len(selected_data)-1, half_length)
+                resampled_data = np.interp(indices, np.arange(len(selected_data)), selected_data)
+                
+                # 從中間開始填充，確保中間對稱
+                processed_data[half_length:] = resampled_data  # 右半部
+                processed_data[:half_length] = resampled_data  # 左半部
+        
+        self.previous_frames.append(processed_data)
+        if len(self.previous_frames) > self.max_frames:
+            self.previous_frames.pop(0)
+        
+        averaged_data = np.mean(self.previous_frames, axis=0)
+        
+        # 正規化
+        max_val = np.max(averaged_data)
+        if max_val > 0:
+            normalized_data = (averaged_data / max_val * 255).astype(int)
+        else:
+            normalized_data = np.zeros(256)
+        
+        # 應用衰減效果
+        for i in range(len(normalized_data)):
+            if normalized_data[i] > self.current_values[i]:
+                self.current_values[i] = normalized_data[i]
+            else:
+                self.current_values[i] *= self.decay_factor
+                
+            if self.current_values[i] < 0.1:
+                self.current_values[i] = 0
+        
+        return self.current_values.astype(int)
+
+
+    def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
+        # 清除背景
         if self.parent.transparent_background:
             painter.eraseRect(self.rect())
         else:
             painter.fillRect(self.rect(), self.parent.background_color)
         
+        # 如果是圓形模式，總是先畫基準圓
+        if self.parent.layout_type == "circle":
+            center_x = self.width() // 2
+            center_y = self.height() // 2
+            radius = min(center_x, center_y) // 3
+            pen = QPen(self.parent.color, 2)
+            painter.setPen(pen)
+            painter.drawEllipse(center_x - radius, center_y - radius, radius * 2, radius * 2)
+        
+        # 如果不在運行狀態，到這裡就返回
+        if not self.parent.is_running:
+            return
+            
+        # 如果正在運行，繼續處理音頻數據
         if self.parent.stream:
             try:
                 data = self.parent.stream.read(self.parent.CHUNK, exception_on_overflow=False)
@@ -277,51 +377,24 @@ class VisualizerCanvas(QWidget):
                 audio_data = np.where(np.abs(audio_data) < self.parent.noise_gate, 0, audio_data)
                 
                 if np.max(np.abs(audio_data)) > self.parent.noise_gate:
-                    fft_data = np.abs(np.fft.fft(audio_data)[:256])
-                    processed_data = np.zeros(256)
-                    start_freq, end_freq = self.parent.frequency_range
-                    frequency_step = (end_freq - start_freq) / len(processed_data)
+                    normalized_data = self.process_audio_data(audio_data)
                     
-                    for i in range(len(processed_data)):
+                    if self.parent.layout_type == "circle":
+                        self.draw_circle_visualization(painter, normalized_data)
+                    else:
                         if self.parent.pattern == "0":
-                            data_index = int(start_freq + i * frequency_step)
+                            self.draw_basic_histogram(painter, normalized_data)
                         else:
-                            lower_half_length = len(fft_data) // 2
-                            data_index = i % lower_half_length
-                            
-                        if 0 <= data_index < len(fft_data):
-                            processed_data[i] = fft_data[data_index]
-                    
-                    max_val = np.max(processed_data)
-                    if max_val > 0:
-                        normalized_data = (processed_data / max_val * 255).astype(int)
-                    else:
-                        normalized_data = np.zeros(256)
-                else:
-                    normalized_data = np.zeros(256)
-                
-                if self.parent.layout_type == "circle":
-                    self.draw_circle_visualization(painter, normalized_data)
-                else:
-                    if self.parent.pattern == "0":
-                        self.draw_basic_histogram(painter, normalized_data)
-                    else:
-                        self.draw_pattern_one_histogram(painter, normalized_data)
+                            self.draw_pattern_one_histogram(painter, normalized_data)
             except Exception as e:
                 print(f"Error reading audio data: {e}")
-    
+        
     def draw_circle_visualization(self, painter, data):
         center_x = self.width() // 2
         center_y = self.height() // 2
         radius = min(center_x, center_y) // 3
         
-        pen = QPen(self.parent.color, 1, Qt.PenStyle.DotLine)
-        painter.setPen(pen)
-        painter.drawEllipse(center_x - radius, center_y - radius, radius * 2, radius * 2)
-        
-        pen.setStyle(Qt.PenStyle.SolidLine)
-        painter.setPen(pen)
-        
+        # 直接繪製頻譜線條
         for i in range(len(data)):
             angle = (i / len(data)) * 2 * np.pi
             value = data[i] / 3
@@ -389,3 +462,4 @@ if __name__ == "__main__":
     window = AudioVisualizer()
     window.show()
     sys.exit(app.exec())
+
